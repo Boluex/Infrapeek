@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+#
+# infrapeek — universal infrastructure preview tool
+# Shows a diagram + validation of your infrastructure before you deploy it.
+#
+# Usage: infrapeek [PATH] [OPTIONS]
+#
+set -o pipefail
+
+VERSION="0.1.0"
+
+# ----------------------------------------------------------------------------
+# Locate the lib/ directory (works both from source tree and after install)
+# ----------------------------------------------------------------------------
+SCRIPT_SInfra="${BASH_SOURCE[0]}"
+# resolve symlinks
+while [ -h "$SCRIPT_SInfra" ]; do
+  _dir=$(cd -P "$(dirname "$SCRIPT_SInfra")" >/dev/null 2>&1 && pwd)
+  SCRIPT_SInfra=$(readlink "$SCRIPT_SInfra")
+  [[ "$SCRIPT_SInfra" != /* ]] && SCRIPT_SInfra="$_dir/$SCRIPT_SInfra"
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$SCRIPT_SInfra")" >/dev/null 2>&1 && pwd)
+
+LIB=""
+for _cand in "${INFRAPEEK_LIB:-}" "$SCRIPT_DIR/lib" "$HOME/.local/lib/infrapeek" "/usr/local/lib/infrapeek" "/usr/lib/infrapeek" "$HOME/.infrapeek/lib"; do
+  [ -z "$_cand" ] && continue
+  if [ -f "$_cand/detect.sh" ]; then LIB="$_cand"; break; fi
+done
+if [ -z "$LIB" ]; then
+  echo "infrapeek: could not locate lib/ directory" >&2
+  exit 1
+fi
+
+# ----------------------------------------------------------------------------
+# Shared in-memory data model (the single source of truth all libs use)
+# ----------------------------------------------------------------------------
+declare -a IP_RES_ID=()
+declare -A IP_RES_TYPE=()
+declare -A IP_RES_NAME=()
+declare -A IP_RES_CAT=()
+declare -A IP_RES_META=()
+declare -a IP_EDGES=()
+IP_RES_N=0
+IP_LAST_ID=""
+IP_RAW=""
+IP_FORMAT=""
+IP_LOCALSTACK=0
+
+ip_add_resource() {
+  # args: type name [category] [meta]   -> sets IP_LAST_ID (no subshell!)
+  local id="r${IP_RES_N}"
+  IP_RES_N=$((IP_RES_N + 1))
+  IP_RES_ID+=("$id")
+  IP_RES_TYPE["$id"]="$1"
+  IP_RES_NAME["$id"]="$2"
+  IP_RES_CAT["$id"]="${3:-other}"
+  IP_RES_META["$id"]="${4:-}"
+  IP_LAST_ID="$id"
+}
+
+ip_add_edge() {
+  [ -n "$1" ] && [ -n "$2" ] && [ "$1" != "$2" ] && IP_EDGES+=("$1|$2")
+  return 0
+}
+
+ip_cat_for_type() {
+  # Map a resource type / k8s kind / image to a coarse category.
+  local t; t=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$t" in
+    *cloudfront*|*api_gateway*|*apigateway*|*ingress*|*alb|*_lb|*load_balanc*|*elb*|*lb_listener*) echo gateway ;;
+    *db_instance*|*_rds*|*rds_*|*aurora*|*dynamodb*|*documentdb*|*neptune*|*elasticache*|*redis*) echo datastore ;;
+    *lambda*|*ecs*|*fargate*|*eks*|*deployment*|*replicaset*|*statefulset*|*daemonset*|*ec2_instance*|*_instance*|*pod*|*job*|*cronjob*|*autoscal*|*batch*|*function*) echo compute ;;
+    *sqs*|*sns*|*kinesis*|*eventbridge*|*mq*|*kafka*|*rabbitmq*|*queue*|*topic*) echo queue ;;
+    *s3*|*bucket*|*ebs*|*efs*|*persistentvolume*|*pvc*|*_volume*) echo storage ;;
+    *dynamodb*|*_rds*|*rds_*|*aurora*|*db_instance*|*database*|*elasticache*|*redis*|*documentdb*|*neptune*|*_table*|*postgres*|*mysql*|*mongo*) echo datastore ;;
+    *iam*|*_role*|*_policy*|*security_group*|*secret*|*kms*|*serviceaccount*|*configmap*) echo iam ;;
+    *vpc*|*subnet*|*route_table*|*internet_gateway*|*nat_gateway*|*_network*|*endpoint*|*service*) echo network ;;
+    *) echo other ;;
+  esac
+}
+
+# generic helpers --------------------------------------------------------------
+ip_repeat() { local c="$1" n="$2" o="" i; for ((i=0; i<n; i++)); do o+="$c"; done; printf '%s' "$o"; }
+
+# ----------------------------------------------------------------------------
+# Colours (disabled when not a TTY or NO_COLOR set)
+# ----------------------------------------------------------------------------
+if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RST=$'\033[0m'
+  RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYN=$'\033[36m'
+else
+  BOLD=""; DIM=""; RST=""; RED=""; GRN=""; YEL=""; CYN=""
+fi
+
+# ----------------------------------------------------------------------------
+# Source the libraries
+# ----------------------------------------------------------------------------
+# shellcheck source=/dev/null
+source "$LIB/detect.sh"
+source "$LIB/parse_terraform.sh"
+source "$LIB/parse_compose.sh"
+source "$LIB/parse_k8s.sh"
+source "$LIB/parse_cdk.sh"
+source "$LIB/render_ascii.sh"
+source "$LIB/render_tree.sh"
+source "$LIB/render_vpc.sh"
+source "$LIB/render_dot.sh"
+source "$LIB/render_mermaid.sh"
+source "$LIB/render_fzf.sh"
+source "$LIB/validate.sh"
+
+# ----------------------------------------------------------------------------
+# Help / version
+# ----------------------------------------------------------------------------
+ip_usage() {
+  cat <<EOF
+${BOLD}infrapeek${RST} v$VERSION — preview your infrastructure before you deploy it
+
+${BOLD}USAGE${RST}
+  infrapeek [PATH] [OPTIONS]
+
+${BOLD}ARGUMENTS${RST}
+  PATH              Directory to scan (default: current directory)
+
+${BOLD}OPTIONS${RST}
+  --diagram         Export PNG + SVG (requires graphviz 'dot')
+  --mermaid         Print a Mermaid graph of the real dependency graph (no deps)
+  --ascii-graph     Draw the real dependency graph as ASCII in the terminal
+                    (requires graph-easy)
+  --wide            Force the full branching diagram even if it's wider than
+                    the terminal (pair with: infrapeek --wide | less -S)
+  --flat            Use the flat dependency graph instead of the nested
+                    VPC/network view (Terraform)
+  --interactive     Launch interactive resource browser (requires fzf)
+  --format FMT      Force a parser: tf | k8s | compose | cdk
+  --no-warn         Skip the validation / warnings section
+  --version         Print version and exit
+  --help            Print this help and exit
+
+${BOLD}EXAMPLES${RST}
+  infrapeek                       # scan current dir
+  infrapeek ~/my-terraform-proj   # scan a specific path
+  infrapeek --diagram             # also export PNG + SVG
+  infrapeek --interactive         # fzf resource browser
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+TARGET="."
+OPT_DIAGRAM=0
+OPT_MERMAID=0
+OPT_ASCII_GRAPH=0
+OPT_INTERACTIVE=0
+OPT_WIDE=0
+OPT_FLAT=0
+OPT_FORMAT=""
+OPT_WARN=1
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --diagram)      OPT_DIAGRAM=1 ;;
+    --mermaid)      OPT_MERMAID=1 ;;
+    --ascii-graph|--graph) OPT_ASCII_GRAPH=1 ;;
+    --wide)         OPT_WIDE=1 ;;
+    --flat)         OPT_FLAT=1 ;;
+    --interactive)  OPT_INTERACTIVE=1 ;;
+    --format)       shift; OPT_FORMAT="$1" ;;
+    --format=*)     OPT_FORMAT="${1#*=}" ;;
+    --no-warn)      OPT_WARN=0 ;;
+    --version|-V)   echo "infrapeek v$VERSION"; exit 0 ;;
+    --help|-h)      ip_usage; exit 0 ;;
+    -*)             echo "infrapeek: unknown option '$1'" >&2; ip_usage; exit 2 ;;
+    *)              TARGET="$1" ;;
+  esac
+  shift
+done
+
+if [ ! -d "$TARGET" ]; then
+  echo "${RED}infrapeek:${RST} '$TARGET' is not a directory" >&2
+  exit 2
+fi
+TARGET=$(cd "$TARGET" && pwd)
+
+# ----------------------------------------------------------------------------
+# Step 1 — detect format
+# ----------------------------------------------------------------------------
+case "$OPT_FORMAT" in
+  tf|terraform) IP_FORMAT="terraform" ;;
+  compose)      IP_FORMAT="compose" ;;
+  k8s|kubernetes) IP_FORMAT="k8s" ;;
+  cdk)          IP_FORMAT="cdk" ;;
+  "")           IP_FORMAT=$(ip_detect "$TARGET") ;;
+  *) echo "${RED}infrapeek:${RST} unknown --format '$OPT_FORMAT'" >&2; exit 2 ;;
+esac
+
+if [ -z "$IP_FORMAT" ]; then
+  echo "${YEL}infrapeek:${RST} could not detect any supported infrastructure in '$TARGET'" >&2
+  echo "Supported: Terraform (*.tf), Docker Compose, Kubernetes YAML, AWS CDK" >&2
+  echo "Try forcing one with --format tf|compose|k8s|cdk" >&2
+  exit 1
+fi
+
+ip_detect_localstack "$TARGET" && IP_LOCALSTACK=1
+
+# ----------------------------------------------------------------------------
+# Step 2/3 — parse + build graph
+# ----------------------------------------------------------------------------
+case "$IP_FORMAT" in
+  terraform) ip_parse_terraform "$TARGET" ;;
+  compose)   ip_parse_compose "$TARGET" ;;
+  k8s)       ip_parse_k8s "$TARGET" ;;
+  cdk)       ip_parse_cdk "$TARGET" ;;
+esac
+
+if [ "${#IP_RES_ID[@]}" -eq 0 ]; then
+  echo "${YEL}infrapeek:${RST} parsed '$IP_FORMAT' but found no resources in '$TARGET'" >&2
+  exit 1
+fi
+
+# ----------------------------------------------------------------------------
+# Step 4 — render
+# ----------------------------------------------------------------------------
+BAR=$(ip_repeat "━" 50)
+
+# build the header badge, e.g. "Terraform • LocalStack"
+case "$IP_FORMAT" in
+  terraform) _badge="Terraform" ;;
+  compose)   _badge="Docker Compose" ;;
+  k8s)       _badge="Kubernetes" ;;
+  cdk)       _badge="AWS CDK" ;;
+esac
+[ "$IP_LOCALSTACK" -eq 1 ] && _badge="$_badge • LocalStack"
+
+printf '%s\n' "$BAR"
+printf ' %sinfrapeek%s  v%s          %s%s%s\n' "$BOLD" "$RST" "$VERSION" "$CYN" "$_badge" "$RST"
+printf '%s\n\n' "$BAR"
+
+# --- ARCHITECTURE ---
+printf '%sARCHITECTURE%s\n\n' "$BOLD" "$RST"
+# Fit-to-terminal: when writing to a real terminal, find its width so the tree
+# renderer can fall back to a compact layout if the branching view won't fit.
+# When piped/redirected (e.g. into `less -S`) or forced, render the full width.
+if [ "$OPT_WIDE" -eq 1 ]; then
+  IP_TERM_WIDTH=0
+elif [ -t 1 ]; then
+  IP_TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
+else
+  IP_TERM_WIDTH=${IP_TERM_WIDTH:-0}   # piped: honor an explicit override, else unlimited
+fi
+IP_DIR="$TARGET"
+export IP_TERM_WIDTH IP_DIR
+
+# Terraform projects with a VPC get the nested network view; everything else
+# (and --flat) gets the flat layered/branching graph.
+IP_IS_VPC=0
+if [ "$IP_FORMAT" = "terraform" ] && [ "$OPT_FLAT" -ne 1 ] \
+   && printf '%s' "$IP_RAW" | grep -q 'resource[[:space:]]*"aws_vpc"'; then
+  IP_IS_VPC=1
+fi
+
+if [ "$IP_IS_VPC" -eq 1 ]; then
+  ip_render_vpc
+else
+  ip_render_tree
+fi
+echo
+
+# --- RESOURCES ---
+printf '%sRESOURCES (%d)%s\n' "$BOLD" "${#IP_RES_ID[@]}" "$RST"
+ip_repeat "─" 50; echo
+for _id in "${IP_RES_ID[@]}"; do
+  printf '  %s✓%s  %-28s %s\n' "$GRN" "$RST" "${IP_RES_TYPE[$_id]}" "${IP_RES_NAME[$_id]}"
+done
+echo
+
+# --- WARNINGS ---
+if [ "$OPT_WARN" -eq 1 ]; then
+  printf '%sWARNINGS%s\n' "$BOLD" "$RST"
+  ip_repeat "─" 50; echo
+  ip_validate
+  echo
+fi
+
+# --- optional outputs ---
+if [ "$OPT_DIAGRAM" -eq 1 ]; then
+  if [ "$IP_IS_VPC" -eq 1 ]; then
+    ip_render_vpc_diagram     # nested VPC image, matches the terminal view
+  else
+    ip_render_dot
+  fi
+  echo
+fi
+
+if [ "$OPT_ASCII_GRAPH" -eq 1 ]; then
+  ip_render_graph_ascii
+  echo
+fi
+
+if [ "$OPT_MERMAID" -eq 1 ]; then
+  ip_render_mermaid
+  echo
+fi
+
+if [ "$OPT_INTERACTIVE" -eq 1 ]; then
+  ip_render_fzf
+fi
+
+# --- footer ---
+printf '%s\n' "$BAR"
